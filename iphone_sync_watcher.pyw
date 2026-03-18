@@ -16,8 +16,10 @@ SYNC_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iphone_s
 LOG_FILE = os.path.join(str(Path.home()), ".icloud_sync", "watcher.log")
 POLL_INTERVAL = 15  # seconds between USB checks
 
-# Apple iPhone USB vendor/product IDs
-IPHONE_VID = "VID_05AC"
+# Use pythonw.exe to avoid any console windows
+PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+if not os.path.exists(PYTHONW):
+    PYTHONW = sys.executable
 
 
 def setup_logging():
@@ -61,7 +63,7 @@ def main():
                 # iPhone just connected
                 logging.info("iPhone connected - starting sync")
                 sync_process = subprocess.Popen(
-                    [sys.executable, SYNC_SCRIPT, "--background"],
+                    [PYTHONW, SYNC_SCRIPT, "--background"],
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 logging.info(f"Sync process started (PID {sync_process.pid})")
@@ -82,7 +84,7 @@ def main():
             if connected and sync_process and sync_process.poll() is not None:
                 logging.info(f"Sync process exited ({sync_process.returncode}), restarting...")
                 sync_process = subprocess.Popen(
-                    [sys.executable, SYNC_SCRIPT, "--background"],
+                    [PYTHONW, SYNC_SCRIPT, "--background"],
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
 
