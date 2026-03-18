@@ -1,31 +1,33 @@
 """
 iPhone Photo & Video Sync Tool
-Continuously syncs today's photos and videos from iCloud Photos to target folder.
-Uses icloudpy with cached credentials (only need to authenticate once).
+Continuously syncs today's photos and videos from iPhone via USB.
+Uses pymobiledevice3 (Apple AFC protocol) - no iCloud login needed.
 Polls every 2 minutes for new photos.
 """
 
+import asyncio
 import os
 import sys
 import json
-import getpass
+import struct
 import time
+from datetime import datetime, date, timedelta
+from pathlib import Path
+
+from PIL import Image
+from PIL.ExifTags import Base as ExifBase
 import pywintypes
 import win32file
 import win32con
-from datetime import datetime, date
-from pathlib import Path
 
-from icloudpy import ICloudPyService
+from pymobiledevice3.usbmux import select_devices_by_connection_type
+from pymobiledevice3.lockdown import create_using_usbmux
+from pymobiledevice3.services.afc import AfcService
 
 # Target directory
 TARGET_DIR = r"D:\Dropbox\! Youtube"
 # State file to track synced files
 STATE_FILE = os.path.join(TARGET_DIR, ".iphone_sync_state.json")
-# Config/session cache directory
-CONFIG_DIR = os.path.join(str(Path.home()), ".icloud_sync")
-COOKIE_DIR = CONFIG_DIR
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 # Poll interval in seconds
 POLL_INTERVAL = 120
 # Extensions to sync
@@ -48,124 +50,114 @@ def save_state(state):
         json.dump(state, f)
 
 
-def set_file_dates(filepath, created, modified):
-    """Set file creation and modification dates on Windows."""
+def set_file_dates_from_metadata(filepath):
+    """Read EXIF (photos) or MP4/MOV atom (videos) and set file timestamps."""
+    dt = None
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # Photos: read EXIF
+    if ext in (".jpg", ".jpeg", ".heic", ".png", ".tif", ".tiff"):
+        try:
+            img = Image.open(filepath)
+            exif = img.getexif()
+            for tag in [36867, 36868, 306]:  # DateTimeOriginal, DateTimeDigitized, DateTime
+                val = exif.get(tag)
+                if val:
+                    dt = datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                    break
+        except Exception:
+            pass
+
+    # Videos: read mvhd atom
+    elif ext in (".mov", ".mp4", ".m4v"):
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    pos = f.tell()
+                    header = f.read(8)
+                    if len(header) < 8:
+                        break
+                    size = struct.unpack(">I", header[:4])[0]
+                    box_type = header[4:8]
+                    if size == 0:
+                        break
+                    if size == 1:
+                        f.read(8)
+                        size = struct.unpack(">Q", f.read(8))[0]
+                    if box_type == b"moov":
+                        moov_end = pos + size
+                        while f.tell() < moov_end:
+                            ipos = f.tell()
+                            ih = f.read(8)
+                            if len(ih) < 8:
+                                break
+                            isize = struct.unpack(">I", ih[:4])[0]
+                            if ih[4:8] == b"mvhd":
+                                version = struct.unpack(">B", f.read(1))[0]
+                                f.read(3)
+                                ct = struct.unpack(">I" if version == 0 else ">Q", f.read(4 if version == 0 else 8))[0]
+                                if ct > 0:
+                                    dt = datetime(1904, 1, 1) + timedelta(seconds=ct)
+                                break
+                            else:
+                                if isize <= 8:
+                                    break
+                                f.seek(ipos + isize)
+                        break
+                    else:
+                        f.seek(pos + size)
+        except Exception:
+            pass
+
+    if dt and dt.year >= 2000:
+        try:
+            ts = pywintypes.Time(dt)
+            handle = win32file.CreateFile(
+                filepath, win32con.GENERIC_WRITE,
+                win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
+                None, win32con.OPEN_EXISTING,
+                win32con.FILE_ATTRIBUTE_NORMAL, None,
+            )
+            win32file.SetFileTime(handle, ts, ts, ts)
+            handle.Close()
+        except Exception:
+            try:
+                os.utime(filepath, (dt.timestamp(), dt.timestamp()))
+            except Exception:
+                pass
+
+
+def set_file_dates_from_stat(filepath, file_date):
+    """Set file timestamps from AFC stat date."""
     try:
-        ts_created = pywintypes.Time(created)
-        ts_modified = pywintypes.Time(modified)
+        ts = pywintypes.Time(file_date)
         handle = win32file.CreateFile(
             filepath, win32con.GENERIC_WRITE,
             win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
             None, win32con.OPEN_EXISTING,
             win32con.FILE_ATTRIBUTE_NORMAL, None,
         )
-        win32file.SetFileTime(handle, ts_created, ts_modified, ts_modified)
+        win32file.SetFileTime(handle, ts, ts, ts)
         handle.Close()
     except Exception:
-        # Fallback: at least set modification time
         try:
-            os.utime(filepath, (modified.timestamp(), modified.timestamp()))
+            os.utime(filepath, (file_date.timestamp(), file_date.timestamp()))
         except Exception:
             pass
 
 
-def download_photo(photo, local_path):
-    """Download a photo/video from iCloud."""
-    for version in ["original", "medium"]:
-        try:
-            download = photo.download(version)
-            if download:
-                with open(local_path, "wb") as f:
-                    for chunk in download.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                return os.path.getsize(local_path)
-        except Exception:
-            continue
-    return 0
+async def connect_iphone():
+    """Connect to iPhone via USB."""
+    devices = await select_devices_by_connection_type(connection_type="USB")
+    if not devices:
+        return None, None
+    lockdown = await create_using_usbmux(serial=devices[0].serial)
+    afc = AfcService(lockdown)
+    return lockdown, afc
 
 
-def load_config():
-    """Load saved config (Apple ID)."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-
-
-def get_apple_id():
-    """Get Apple ID from CLI arg, config, or interactive prompt."""
-    if len(sys.argv) > 1:
-        apple_id = sys.argv[1]
-    else:
-        config = load_config()
-        apple_id = config.get("apple_id")
-
-    if not apple_id:
-        apple_id = input("Apple ID: ").strip()
-
-    # Save for future use
-    config = load_config()
-    config["apple_id"] = apple_id
-    save_config(config)
-
-    return apple_id
-
-
-def connect_icloud(apple_id, interactive=True):
-    """Connect to iCloud, using cached session if available."""
-    os.makedirs(COOKIE_DIR, exist_ok=True)
-
-    try:
-        # Try connecting with cached session (no password needed)
-        api = ICloudPyService(apple_id, cookie_directory=COOKIE_DIR)
-        if not api.requires_2fa and not api.requires_2sa:
-            print("Logged in using cached session!")
-            return api
-    except Exception:
-        pass
-
-    if not interactive:
-        print("Session expired - need interactive login. Run iphone_sync.py manually once.")
-        return None
-
-    # Need password
-    password = getpass.getpass("Password: ")
-    api = ICloudPyService(apple_id, password, cookie_directory=COOKIE_DIR)
-
-    if api.requires_2fa:
-        code = input("Enter 2FA code from your device: ").strip()
-        if not api.validate_2fa_code(code):
-            print("ERROR: Invalid 2FA code")
-            sys.exit(1)
-        print("2FA verified!")
-        if not api.is_trusted_session:
-            api.trust_session()
-
-    if api.requires_2sa:
-        devices = api.trusted_devices
-        for i, d in enumerate(devices):
-            print(f"  [{i}] {d.get('deviceName', 'Unknown')}")
-        idx = int(input("Select device for verification: ").strip())
-        if not api.send_verification_code(devices[idx]):
-            print("ERROR: Failed to send code")
-            sys.exit(1)
-        code = input("Enter verification code: ").strip()
-        if not api.validate_verification_code(devices[idx], code):
-            print("ERROR: Invalid code")
-            sys.exit(1)
-
-    return api
-
-
-def sync_once(api, state):
-    """Run one sync pass. Returns number of new files."""
+async def sync_once(afc, state):
+    """Run one sync pass via USB. Returns (new_files, errors, bytes)."""
     today = date.today()
     synced = state["synced_files"]
     os.makedirs(TARGET_DIR, exist_ok=True)
@@ -174,133 +166,131 @@ def sync_once(api, state):
     total_errors = 0
     total_bytes = 0
 
-    photos = api.photos
-    consecutive_old = 0
+    all_entries = await afc.listdir("/DCIM")
+    folders = sorted([f for f in all_entries if "APPLE" in f or (f[0].isdigit() and "_" in f)])
 
-    for photo in photos.all:
+    for folder in folders:
+        folder_path = f"/DCIM/{folder}"
         try:
-            photo_date = photo.asset_date or photo.added_date
-            if photo_date is None:
-                continue
+            files = await afc.listdir(folder_path)
+        except Exception:
+            total_errors += 1
+            continue
 
-            if hasattr(photo_date, 'date'):
-                pdate = photo_date.date()
-            else:
-                continue
+        media_files = sorted([
+            f for f in files
+            if not f.startswith(".") and os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS
+        ])
 
-            if pdate != today:
-                consecutive_old += 1
-                # Stop after 200 consecutive non-today photos
-                if consecutive_old > 200:
-                    break
-                continue
+        for filename in media_files:
+            remote_path = f"{folder_path}/{filename}"
+            sync_key = f"{folder}/{filename}"
 
-            consecutive_old = 0
-            filename = photo.filename
-            if not filename:
-                continue
-
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in MEDIA_EXTENSIONS:
-                continue
-
-            sync_key = f"icloud/{filename}"
             if sync_key in synced:
                 continue
 
-            sub_dir = TARGET_DIR
-            os.makedirs(sub_dir, exist_ok=True)
-            local_path = os.path.join(sub_dir, filename)
-
-            # Skip if file already exists with same size
-            if os.path.exists(local_path) and photo.size and os.path.getsize(local_path) == photo.size:
-                synced[sync_key] = {"size": photo.size, "date": photo_date.isoformat(), "synced_at": datetime.now().isoformat()}
+            # Get file date from iPhone
+            try:
+                st = await afc.stat(remote_path)
+                mtime = st.get("st_mtime", st.get("st_birthtime"))
+                if isinstance(mtime, datetime):
+                    file_date = mtime
+                else:
+                    continue
+            except Exception:
                 continue
+
+            # Only sync today's files
+            if file_date.date() != today:
+                continue
+
+            # Target path
+            local_path = os.path.join(TARGET_DIR, filename)
+
+            # Skip if already exists with same size
+            try:
+                remote_size = st.get("st_size", 0)
+                if isinstance(remote_size, int) and remote_size > 0 and os.path.exists(local_path):
+                    if os.path.getsize(local_path) == remote_size:
+                        synced[sync_key] = {"size": remote_size, "date": file_date.isoformat(), "synced_at": datetime.now().isoformat()}
+                        continue
+            except Exception:
+                pass
 
             if os.path.exists(local_path):
                 base, ext_str = os.path.splitext(filename)
                 counter = 1
                 while os.path.exists(local_path):
-                    local_path = os.path.join(sub_dir, f"{base}_{counter}{ext_str}")
+                    local_path = os.path.join(TARGET_DIR, f"{base}_{counter}{ext_str}")
                     counter += 1
 
-            print(f"  Downloading {filename}...", end=" ", flush=True)
-            file_size = download_photo(photo, local_path)
+            # Download via USB
+            try:
+                data = await afc.get_file_contents(remote_path)
+                with open(local_path, "wb") as f:
+                    f.write(data)
 
-            if file_size > 0:
-                # Set original creation and modification dates
-                created = photo.asset_date or photo_date
-                modified = photo_date
-                set_file_dates(local_path, created, modified)
+                file_size = len(data)
+
+                # Set timestamps from metadata (EXIF/MP4), fallback to AFC stat
+                set_file_dates_from_metadata(local_path)
+                # Verify dates were set, fallback to stat date
+                local_mtime = datetime.fromtimestamp(os.path.getmtime(local_path))
+                if abs((local_mtime - datetime.now()).total_seconds()) < 60:
+                    # Dates weren't set from metadata, use stat date
+                    set_file_dates_from_stat(local_path, file_date)
 
                 total_bytes += file_size
                 total_new += 1
                 synced[sync_key] = {
                     "size": file_size,
-                    "date": photo_date.isoformat(),
+                    "date": file_date.isoformat(),
                     "synced_at": datetime.now().isoformat(),
                 }
                 size_mb = file_size / (1024 * 1024)
-                print(f"OK ({size_mb:.1f} MB)")
+                print(f"  [{total_new}] {filename} ({size_mb:.1f} MB)")
 
-                if total_new % 5 == 0:
+                if total_new % 10 == 0:
                     save_state(state)
-            else:
-                print("FAILED")
-                total_errors += 1
 
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            total_errors += 1
+            except Exception as e:
+                print(f"  ERROR {filename}: {e}")
+                total_errors += 1
 
     save_state(state)
     return total_new, total_errors, total_bytes
 
 
-def main():
-    print("iPhone Photo & Video Sync (iCloud)")
+async def main():
+    print("iPhone Photo & Video Sync (USB)")
     print("=" * 50)
     print(f"Target:   {TARGET_DIR}")
-    print(f"Interval: every {POLL_INTERVAL}s")
-    print(f"Session:  {COOKIE_DIR}\n")
-
-    # --background flag: non-interactive mode (used by watcher)
-    interactive = "--background" not in sys.argv
-
-    apple_id = get_apple_id()
-    api = connect_icloud(apple_id, interactive=interactive)
-    if api is None:
-        sys.exit(1)
-    print(f"Connected to iCloud!\n")
+    print(f"Interval: every {POLL_INTERVAL}s\n")
 
     state = load_state()
     run = 1
 
     while True:
-        today = date.today()
         now = datetime.now().strftime("%H:%M:%S")
+        today = date.today()
         print(f"[{now}] Sync #{run} - checking for new photos from {today}...")
 
         try:
-            new_files, errors, new_bytes = sync_once(api, state)
-            if new_files > 0:
-                mb = new_bytes / (1024 * 1024)
-                print(f"[{now}] Synced {new_files} new file(s) ({mb:.1f} MB)")
+            lockdown, afc = await connect_iphone()
+            if afc is None:
+                print(f"[{now}] iPhone not connected")
             else:
-                print(f"[{now}] No new files")
-            if errors > 0:
-                print(f"[{now}] {errors} error(s)")
+                print(f"[{now}] Connected to {lockdown.display_name}")
+                new_files, errors, new_bytes = await sync_once(afc, state)
+                if new_files > 0:
+                    mb = new_bytes / (1024 * 1024)
+                    print(f"[{now}] Synced {new_files} new file(s) ({mb:.1f} MB)")
+                else:
+                    print(f"[{now}] No new files")
+                if errors > 0:
+                    print(f"[{now}] {errors} error(s)")
         except Exception as e:
-            print(f"[{now}] Error during sync: {e}")
-            print("  Attempting to reconnect...")
-            try:
-                api = connect_icloud(apple_id, interactive=interactive)
-                if api is None:
-                    print("  Session expired. Run manually to re-authenticate.")
-                    break
-                print("  Reconnected!")
-            except Exception as e2:
-                print(f"  Reconnect failed: {e2}")
+            print(f"[{now}] Error: {e}")
 
         run += 1
         print(f"  Next check in {POLL_INTERVAL}s (Ctrl+C to stop)\n")
@@ -312,4 +302,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
