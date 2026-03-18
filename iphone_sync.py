@@ -10,6 +10,9 @@ import sys
 import json
 import getpass
 import time
+import pywintypes
+import win32file
+import win32con
 from datetime import datetime, date
 from pathlib import Path
 
@@ -43,6 +46,27 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
+
+
+def set_file_dates(filepath, created, modified):
+    """Set file creation and modification dates on Windows."""
+    try:
+        ts_created = pywintypes.Time(created)
+        ts_modified = pywintypes.Time(modified)
+        handle = win32file.CreateFile(
+            filepath, win32con.GENERIC_WRITE,
+            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
+            None, win32con.OPEN_EXISTING,
+            win32con.FILE_ATTRIBUTE_NORMAL, None,
+        )
+        win32file.SetFileTime(handle, ts_created, ts_modified, ts_modified)
+        handle.Close()
+    except Exception:
+        # Fallback: at least set modification time
+        try:
+            os.utime(filepath, (modified.timestamp(), modified.timestamp()))
+        except Exception:
+            pass
 
 
 def download_photo(photo, local_path):
@@ -188,6 +212,11 @@ def sync_once(api, state):
             os.makedirs(sub_dir, exist_ok=True)
             local_path = os.path.join(sub_dir, filename)
 
+            # Skip if file already exists with same size
+            if os.path.exists(local_path) and photo.size and os.path.getsize(local_path) == photo.size:
+                synced[sync_key] = {"size": photo.size, "date": photo_date.isoformat(), "synced_at": datetime.now().isoformat()}
+                continue
+
             if os.path.exists(local_path):
                 base, ext_str = os.path.splitext(filename)
                 counter = 1
@@ -199,6 +228,11 @@ def sync_once(api, state):
             file_size = download_photo(photo, local_path)
 
             if file_size > 0:
+                # Set original creation and modification dates
+                created = photo.asset_date or photo_date
+                modified = photo_date
+                set_file_dates(local_path, created, modified)
+
                 total_bytes += file_size
                 total_new += 1
                 synced[sync_key] = {
