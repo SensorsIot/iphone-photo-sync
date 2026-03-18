@@ -8,9 +8,10 @@ import subprocess
 import time
 import sys
 import os
-import ctypes
 import logging
 from pathlib import Path
+
+import wmi
 
 SYNC_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iphone_sync.py")
 LOG_FILE = os.path.join(str(Path.home()), ".icloud_sync", "watcher.log")
@@ -33,17 +34,15 @@ def setup_logging():
 
 
 def is_iphone_connected():
-    """Check if an iPhone is connected via USB using WMI."""
+    """Check if an iPhone is connected via USB using WMI (no subprocess/terminal)."""
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-PnpDevice -Class 'WPD' -Status 'OK' | "
-             "Where-Object { $_.InstanceId -match '05AC' } | "
-             "Measure-Object | Select-Object -ExpandProperty Count"],
-            capture_output=True, text=True, timeout=10
+        w = wmi.WMI()
+        # Apple vendor ID is 05AC
+        devices = w.query(
+            "SELECT * FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%VID_05AC%' "
+            "AND PNPClass = 'WPD' AND Status = 'OK'"
         )
-        count = int(result.stdout.strip())
-        return count > 0
+        return len(devices) > 0
     except Exception:
         return False
 
