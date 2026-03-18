@@ -1,21 +1,21 @@
 """
 iPhone Sync Watcher
-Runs silently in the background. Listens for iPhone USB connect/disconnect
-events and starts/stops sync accordingly. No polling needed.
-Uses .pyw extension to run without a console window.
+Runs silently in the background. Detects iPhone USB connection/disconnection
+and starts/stops sync accordingly. Uses .pyw extension for no console window.
 """
 
 import subprocess
+import time
 import sys
 import os
 import logging
-import threading
 from pathlib import Path
 
 import wmi
 
 SYNC_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iphone_sync.py")
 LOG_FILE = os.path.join(str(Path.home()), ".icloud_sync", "watcher.log")
+POLL_INTERVAL = 10  # seconds between USB checks
 
 # Use pythonw.exe to avoid any console windows
 PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -34,7 +34,7 @@ def setup_logging():
 
 
 def is_iphone_connected():
-    """Check if an iPhone is currently connected."""
+    """Check if an iPhone is connected via USB using WMI (no subprocess)."""
     try:
         w = wmi.WMI()
         devices = w.query(
@@ -46,91 +46,51 @@ def is_iphone_connected():
         return False
 
 
-def start_sync():
-    """Start the sync process."""
-    return subprocess.Popen(
-        [PYTHONW, SYNC_SCRIPT, "--background"],
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-
-def stop_sync(proc):
-    """Stop the sync process."""
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
 def main():
     setup_logging()
-    logging.info("iPhone Sync Watcher started (event-driven)")
+    logging.info("iPhone Sync Watcher started")
 
     sync_process = None
+    was_connected = False
 
-    # Check if iPhone is already connected at startup
-    if is_iphone_connected():
-        logging.info("iPhone already connected at startup - starting sync")
-        sync_process = start_sync()
-        logging.info(f"Sync process started (PID {sync_process.pid})")
+    while True:
+        try:
+            connected = is_iphone_connected()
 
-    w = wmi.WMI()
+            if connected and not was_connected:
+                logging.info("iPhone connected - starting sync")
+                sync_process = subprocess.Popen(
+                    [PYTHONW, SYNC_SCRIPT, "--background"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                logging.info(f"Sync process started (PID {sync_process.pid})")
 
-    # Watch for USB device arrivals
-    def watch_connections():
-        nonlocal sync_process
-        watcher = w.watch_for(
-            notification_type="Creation",
-            wmi_class="Win32_PnPEntity",
-            delay_secs=2,
-        )
-        while True:
-            try:
-                event = watcher()
-                device_id = getattr(event, "PNPDeviceID", "")
-                if "VID_05AC" in device_id:
-                    logging.info(f"Apple device connected: {device_id}")
-                    # Small delay to let the device fully initialize
-                    import time
-                    time.sleep(3)
-                    if is_iphone_connected() and (sync_process is None or sync_process.poll() is not None):
-                        logging.info("iPhone connected - starting sync")
-                        sync_process = start_sync()
-                        logging.info(f"Sync process started (PID {sync_process.pid})")
-            except Exception as e:
-                logging.error(f"Connection watcher error: {e}")
+            elif not connected and was_connected:
+                logging.info("iPhone disconnected - stopping sync")
+                if sync_process and sync_process.poll() is None:
+                    sync_process.terminate()
+                    try:
+                        sync_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        sync_process.kill()
+                    logging.info("Sync process stopped")
+                sync_process = None
 
-    # Watch for USB device removals
-    def watch_disconnections():
-        nonlocal sync_process
-        watcher = w.watch_for(
-            notification_type="Deletion",
-            wmi_class="Win32_PnPEntity",
-            delay_secs=2,
-        )
-        while True:
-            try:
-                event = watcher()
-                device_id = getattr(event, "PNPDeviceID", "")
-                if "VID_05AC" in device_id:
-                    logging.info(f"Apple device disconnected: {device_id}")
-                    if not is_iphone_connected():
-                        logging.info("iPhone disconnected - stopping sync")
-                        stop_sync(sync_process)
-                        sync_process = None
-                        logging.info("Sync process stopped")
-            except Exception as e:
-                logging.error(f"Disconnection watcher error: {e}")
+            # Restart if sync crashed while phone still connected
+            if connected and sync_process and sync_process.poll() is not None:
+                logging.info(f"Sync process exited ({sync_process.returncode}), restarting in 60s...")
+                time.sleep(60)
+                sync_process = subprocess.Popen(
+                    [PYTHONW, SYNC_SCRIPT, "--background"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
 
-    t_connect = threading.Thread(target=watch_connections, daemon=True)
-    t_disconnect = threading.Thread(target=watch_disconnections, daemon=True)
-    t_connect.start()
-    t_disconnect.start()
+            was_connected = connected
 
-    # Keep main thread alive
-    t_connect.join()
+        except Exception as e:
+            logging.error(f"Error: {e}")
+
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
