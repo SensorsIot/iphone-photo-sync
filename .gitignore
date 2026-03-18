@@ -1,0 +1,18 @@
+# Private data - never commit
+config.json
+*.session
+watcher.log
+.icloud_sync/
+.iphone_sync_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
