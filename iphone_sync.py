@@ -11,7 +11,7 @@ import sys
 import json
 import struct
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -97,7 +97,8 @@ def set_file_dates_from_metadata(filepath):
                                 f.read(3)
                                 ct = struct.unpack(">I" if version == 0 else ">Q", f.read(4 if version == 0 else 8))[0]
                                 if ct > 0:
-                                    dt = datetime(1904, 1, 1) + timedelta(seconds=ct)
+                                    # mvhd creation_time is seconds since 1904-01-01 UTC; convert to local naive
+                                    dt = (datetime(1904, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=ct)).astimezone().replace(tzinfo=None)
                                 break
                             else:
                                 if isize <= 8:
