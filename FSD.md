@@ -1,12 +1,14 @@
 # Functional Specification Document (FSD)
 
-## iPhone Photo Sync — v1.0
+## iPhone Photo Sync — v2.0 (USB)
 
 ---
 
 ## 1. Overview
 
-iPhone Photo Sync is a Windows background service that automatically downloads today's photos and videos from iCloud Photos to a local folder whenever an iPhone is connected via USB. It consists of two components: a USB watcher and a sync engine.
+iPhone Photo Sync is a Windows background service that copies today's photos and videos from an iPhone to a local folder while the iPhone is connected via USB. Files are read directly from the iPhone's camera roll (`/DCIM`) over Apple's AFC protocol using `pymobiledevice3`. No iCloud account, Apple ID or password is involved.
+
+It consists of two components: a USB watcher and a sync engine.
 
 ---
 
@@ -19,21 +21,23 @@ iPhone Photo Sync is a Windows background service that automatically downloads t
 └───────────┬──────────────┘
             │ launches
             v
-┌──────────────────────────┐       USB detected        ┌──────────────────────┐
-│  iphone_sync_watcher.pyw │  ───────────────────────>  │   iphone_sync.py     │
-│  (background watcher)    │  <───────────────────────  │   (sync engine)      │
-│                          │    USB disconnected        │                      │
-│  - Polls USB every 15s   │     (terminates)           │  - Connects to iCloud│
-│  - No console window     │                            │  - Downloads media   │
-│  - Logs to file          │                            │  - Preserves dates   │
-└──────────────────────────┘                            │  - Polls every 120s  │
-                                                        └──────────┬───────────┘
-                                                                   │
+┌──────────────────────────┐       USB detected        ┌──────────────────────────┐
+│  iphone_sync_watcher.pyw │  ───────────────────────>  │   iphone_sync.py         │
+│  (background watcher)    │  <───────────────────────  │   (sync engine)          │
+│                          │    USB disconnected        │                          │
+│  - Polls USB every 10s   │     (terminates)           │  - Connects via usbmux   │
+│  - No console window     │                            │  - Copies today's media  │
+│  - Logs to watcher.log   │                            │  - Preserves dates       │
+└──────────────────────────┘                            │  - Polls every 120s      │
+                                                        │  - Logs to sync.log      │
+                                                        └──────────┬───────────────┘
+                                                                   │ AFC over USB
                                                                    v
-                                                        ┌──────────────────────┐
-                                                        │   iCloud Photos API  │
-                                                        │   (via icloudpy)     │
-                                                        └──────────────────────┘
+                                                        ┌──────────────────────────┐
+                                                        │  iPhone /DCIM            │
+                                                        │  (via Apple Mobile       │
+                                                        │   Device Service usbmux) │
+                                                        └──────────────────────────┘
 ```
 
 ---
@@ -51,8 +55,8 @@ iPhone Photo Sync is a Windows background service that automatically downloads t
 | Function | Description |
 |----------|-------------|
 | `setup_logging()` | Initializes file-based logging to `~/.icloud_sync/watcher.log`. Creates the log directory if it doesn't exist. Log format: `YYYY-MM-DD HH:MM:SS message`. |
-| `is_iphone_connected()` | Queries Windows WMI for PnP devices matching Apple's USB vendor ID (`VID_05AC`) with class `WPD` and status `OK`. Returns `True` if at least one matching device is found. Uses the Python `wmi` library to avoid spawning subprocess/terminal windows. |
-| `main()` | Main event loop. Polls `is_iphone_connected()` every 15 seconds. On state transitions: **connected** — launches `iphone_sync.py` as a subprocess with `--background` flag using `pythonw.exe` and `CREATE_NO_WINDOW`. **disconnected** — terminates the sync subprocess (graceful with 10s timeout, then force kill). Also monitors for unexpected sync process exits and restarts if the iPhone is still connected. |
+| `is_iphone_connected()` | Queries Windows WMI for PnP devices matching Apple's USB vendor ID (`VID_05AC`) with class `WPD` and status `OK`. Returns `True` if at least one matching device is found. Uses the Python `wmi` library to avoid spawning subprocess/terminal windows. Returns `False` on any WMI error. |
+| `main()` | Main event loop. Polls `is_iphone_connected()` every 10 seconds. On state transitions: **connected** — launches `iphone_sync.py` as a subprocess with `--background` flag using `pythonw.exe` and `CREATE_NO_WINDOW`. **disconnected** — terminates the sync subprocess (graceful with 10s timeout, then force kill). If the sync process exits while the iPhone is still connected, waits 60 seconds and starts it again. |
 
 #### Configuration Constants
 
@@ -60,31 +64,29 @@ iPhone Photo Sync is a Windows background service that automatically downloads t
 |----------|-------|-------------|
 | `SYNC_SCRIPT` | `<same directory>/iphone_sync.py` | Path to the sync engine |
 | `LOG_FILE` | `~/.icloud_sync/watcher.log` | Watcher log file path |
-| `POLL_INTERVAL` | `15` seconds | USB detection polling interval |
+| `POLL_INTERVAL` | `10` seconds | USB detection polling interval |
 | `PYTHONW` | Auto-detected `pythonw.exe` | Python interpreter without console |
 
 ---
 
 ### 3.2 Sync Engine (`iphone_sync.py`)
 
-**Purpose:** Connect to iCloud Photos and download today's new photos and videos to the target directory.
+**Purpose:** Copy today's new photos and videos from the connected iPhone to the target directory, preserving their capture timestamps.
 
-**Runtime:** Launched by the watcher (background mode) or manually by the user (interactive mode). Runs in a continuous polling loop until terminated or stopped with Ctrl+C.
+**Runtime:** Launched by the watcher, or manually from a console (`python iphone_sync.py`). Runs in a continuous polling loop until terminated or stopped with Ctrl+C. The `--background` argument passed by the watcher is currently ignored; behavior is identical in both cases except that console output is only shown when a console exists.
 
 #### Functions
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `load_state()` | `() -> dict` | Loads the sync state from `.iphone_sync_state.json` in the target directory. Returns a dict with key `synced_files` mapping sync keys to metadata. Returns empty state if file doesn't exist. |
-| `save_state(state)` | `(dict) -> None` | Persists the sync state dict to the JSON state file. Called after every 5 new downloads and at the end of each sync pass. |
-| `set_file_dates(filepath, created, modified)` | `(str, datetime, datetime) -> None` | Sets the Windows file creation time and modification time using the Win32 API (`SetFileTime`). Falls back to `os.utime()` if the Win32 call fails. Ensures synced files retain their original iPhone capture timestamps. |
-| `download_photo(photo, local_path)` | `(PhotoAsset, str) -> int` | Downloads a single photo/video from iCloud. Tries `original` quality first, falls back to `medium`. Streams data in 1 MB chunks. Returns file size in bytes on success, `0` on failure. |
-| `load_config()` | `() -> dict` | Loads saved configuration (Apple ID) from `~/.icloud_sync/config.json`. |
-| `save_config(config)` | `(dict) -> None` | Saves configuration to the config file. |
-| `get_apple_id()` | `() -> str` | Resolves Apple ID from (in priority order): command-line argument, saved config, interactive prompt. Saves the resolved Apple ID to config for future use. |
-| `connect_icloud(apple_id, interactive)` | `(str, bool) -> ICloudPyService \| None` | Connects to iCloud. First attempts cached session (no password needed). If session expired: in interactive mode, prompts for password and 2FA code; in background mode, returns `None` (requires manual re-authentication). Trusts the session after successful 2FA to extend cookie lifetime. |
-| `sync_once(api, state)` | `(ICloudPyService, dict) -> tuple[int, int, int]` | Executes one sync pass. Iterates all iCloud photos, filters to today's date and supported media extensions. For each new photo: checks sync state and file existence (with size comparison for deduplication), downloads to target directory, sets original timestamps, updates sync state. Stops scanning after 200 consecutive non-today photos. Returns `(new_files, errors, bytes_transferred)`. |
-| `main()` | `() -> None` | Entry point. Determines interactive/background mode from `--background` CLI flag. Resolves Apple ID, connects to iCloud, then enters polling loop: calls `sync_once()` every 120 seconds. On error, attempts reconnection. In background mode, exits if session expires. |
+| `setup_logging()` | `() -> None` | Configures the `iphone_sync` logger: a rotating file handler on `~/.icloud_sync/sync.log` (1 MB, 3 backups, format `YYYY-MM-DD HH:MM:SS LEVEL message`), plus a console handler when `sys.stdout` exists (not under `pythonw.exe`). |
+| `load_state()` | `() -> dict` | Loads the sync state from `.iphone_sync_state.json` in the target directory. Returns a dict with key `synced_files` mapping sync keys to metadata. Returns empty state if the file doesn't exist. |
+| `save_state(state)` | `(dict) -> None` | Persists the sync state dict to the JSON state file. Called after every 10 new downloads and at the end of each sync pass. |
+| `set_file_dates_from_metadata(filepath)` | `(str) -> None` | Reads the capture time from the downloaded file and sets the Windows creation, access and modification times via `SetFileTime` (fallback `os.utime()`). Photos (`.jpg .jpeg .heic .png .tif .tiff`): EXIF `DateTimeOriginal`, then `DateTimeDigitized`, then `DateTime` (local time, via Pillow). Videos (`.mov .mp4 .m4v`): `creation_time` from the `moov/mvhd` atom, converted from UTC to local time. Dates before 2000 are ignored. Does nothing if no date is found. |
+| `set_file_dates_from_stat(filepath, file_date)` | `(str, datetime) -> None` | Sets the file times to the iPhone's AFC modification date. Fallback when no metadata date could be applied. |
+| `connect_iphone()` | `async () -> (LockdownClient, AfcService) \| (None, None)` | Lists USB devices via usbmux and opens a lockdown session and AFC service on the first one. Returns `(None, None)` if no iPhone is connected. Raises if the iPhone is locked or has not trusted this PC. |
+| `sync_once(afc, state)` | `async (AfcService, dict) -> tuple[int, int, int]` | Executes one sync pass over `/DCIM` (see 4.1). Returns `(new_files, errors, bytes_transferred)`. |
+| `main()` | `async () -> None` | Entry point. Sets up logging, loads state, then loops: connect, call `sync_once()`, log the result, sleep 120 seconds. A fresh connection is made on every pass. Exceptions in a pass are logged with traceback and the loop continues. |
 
 #### Configuration Constants
 
@@ -92,9 +94,17 @@ iPhone Photo Sync is a Windows background service that automatically downloads t
 |----------|-------|-------------|
 | `TARGET_DIR` | `D:\Dropbox\! Youtube` | Destination folder for synced media |
 | `STATE_FILE` | `TARGET_DIR/.iphone_sync_state.json` | Tracks which files have been synced |
-| `CONFIG_DIR` | `~/.icloud_sync/` | Session cookies and config storage |
-| `POLL_INTERVAL` | `120` seconds | Time between iCloud sync passes |
+| `POLL_INTERVAL` | `120` seconds | Time between sync passes while connected |
+| `LOG_FILE` | `~/.icloud_sync/sync.log` | Sync log file; output is also echoed to the console when run interactively |
 | `MEDIA_EXTENSIONS` | `.jpg .jpeg .heic .heif .png .tiff .tif .dng .raw .cr2 .nef .arw .mov .mp4 .m4v` | File types to sync |
+
+#### Sync timing
+
+| Event | Delay until files appear |
+|-------|--------------------------|
+| iPhone plugged in | ≤ 10 s (watcher poll) + duration of the first pass |
+| New photo taken while connected | ≤ 120 s + duration of the pass |
+| iPhone unplugged | Sync stops; nothing is copied until the next connection |
 
 ---
 
@@ -103,39 +113,41 @@ iPhone Photo Sync is a Windows background service that automatically downloads t
 ### 4.1 Sync Decision Flow
 
 ```
-For each photo in iCloud:
+List /DCIM, keep folders containing "APPLE" or named <digit>..._... (e.g. 100APPLE, 202410__)
 │
-├─ photo_date != today?          → skip (increment consecutive_old counter)
-│   └─ consecutive_old > 200?    → stop scanning
+For each file in each folder (sorted):
 │
-├─ extension not in MEDIA_EXTENSIONS? → skip
+├─ starts with "." or extension not in MEDIA_EXTENSIONS? → skip
 │
-├─ sync_key in state?            → skip (already synced)
+├─ sync_key "<folder>/<filename>" in state?  → skip (already synced)
 │
-├─ file exists with same size?   → mark as synced, skip download
+├─ AFC stat fails or has no date?            → skip (logged as warning)
 │
-├─ file exists with different size? → download with _N suffix
+├─ st_mtime date != today?                   → skip
 │
-└─ file does not exist           → download
-    └─ set creation/modification dates from photo.asset_date
+├─ local file exists with same size?         → mark as synced, skip download
+│
+├─ local file exists with different size?    → download as <name>_1, _2, ...
+│
+└─ local file does not exist                 → download (whole file into memory)
+    └─ set dates from EXIF / mvhd metadata
+    └─ if mtime still within 60 s of now → set dates from AFC stat date
     └─ update sync state
 ```
 
-### 4.2 Authentication Flow
+All files are written flat into `TARGET_DIR`; the iPhone folder structure is not reproduced.
+
+### 4.2 Connection Flow
 
 ```
-Start
+Watcher sees Apple WPD device (VID_05AC)
 │
-├─ Cached session exists?
-│   ├─ Yes, still valid  → connected
-│   └─ No or expired
-│       ├─ Interactive mode
-│       │   ├─ Prompt password
-│       │   ├─ Prompt 2FA code
-│       │   ├─ Trust session (extend cookie)
-│       │   └─ Connected
-│       └─ Background mode
-│           └─ Return None (user must run manually)
+└─ start iphone_sync.py
+    │
+    └─ every 120 s:
+        ├─ usbmux lists no USB device       → log "iPhone not connected"
+        ├─ lockdown fails (locked/untrusted)→ log exception, retry next pass
+        └─ connected                        → sync_once()
 ```
 
 ---
@@ -146,10 +158,11 @@ Start
 
 | File | Location | Contents |
 |------|----------|----------|
-| `config.json` | `~/.icloud_sync/` | `{"apple_id": "user@example.com"}` |
-| Session cookies | `~/.icloud_sync/` | iCloud authentication tokens |
-| `watcher.log` | `~/.icloud_sync/` | Watcher event log |
-| `.iphone_sync_state.json` | Target directory | `{"synced_files": {"icloud/IMG_1234.JPG": {"size": 1234, "date": "...", "synced_at": "..."}}}` |
+| `watcher.log` | `~/.icloud_sync/` | Watcher event log (connect, disconnect, process start/stop) |
+| `sync.log` (+ `.1`–`.3`) | `~/.icloud_sync/` | Sync engine log: each pass, downloaded files, error tracebacks. Rotates at 1 MB, keeps 3 backups. |
+| `.iphone_sync_state.json` | Target directory | `{"synced_files": {"114APPLE/IMG_1234.JPG": {"size": 1234, "date": "...", "synced_at": "..."}}}` |
+
+The directory name `~/.icloud_sync/` is kept from v1 for compatibility; no iCloud data is stored there any more.
 
 ### 5.2 Repository files (public)
 
@@ -167,9 +180,14 @@ Start
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `icloudpy` | >=0.8.0 | iCloud Photos API access |
+| `pymobiledevice3` | >=9.0 (async API) | usbmux, lockdown and AFC access to the iPhone |
+| `Pillow` | any recent | EXIF date extraction |
 | `wmi` | >=1.5 | Windows USB device detection |
 | `pywin32` | >=300 | Win32 API for setting file timestamps |
+
+**System requirement:** Apple Mobile Device Service (installed with iTunes or the Apple Devices app) must be running; it provides usbmux on Windows.
+
+**Note:** Pillow cannot open HEIC files without the `pillow-heif` plugin. Without it, `.heic` files get their timestamps from the AFC stat date instead of EXIF.
 
 ---
 
@@ -177,20 +195,20 @@ Start
 
 | Scenario | Behavior |
 |----------|----------|
-| iPhone not found | Watcher continues polling; sync engine exits with error |
-| iCloud session expired | Background mode: sync exits, watcher restarts it (which exits again until manual re-auth). Interactive mode: prompts for password |
-| Download failure | Logs error, continues to next photo. Retried on next sync pass since file won't be in state |
-| Sync process crash | Watcher detects exit code and restarts process if iPhone still connected |
-| Network timeout | icloudpy raises exception, caught by sync loop, triggers reconnection attempt |
-| File write error | Logged as error, file not added to sync state (will retry next pass) |
+| iPhone not connected | Watcher keeps polling; sync engine logs "iPhone not connected" and retries every 120 s |
+| iPhone locked or PC not trusted | Lockdown raises; exception logged with traceback, retried next pass |
+| Folder cannot be listed | Logged as error, counted, folder skipped |
+| File stat fails | Logged as warning, file skipped (retried next pass) |
+| Download or write failure | Logged with traceback, file not added to state (retried next pass) |
+| Sync process crash | Logged as "Sync crashed"; watcher restarts it after 60 s if the iPhone is still connected |
+| State file unreadable | Logged with traceback; process exits and watcher restarts it |
 | Duplicate filename | If same size: skip. If different size: append `_1`, `_2`, etc. suffix |
 
 ---
 
 ## 8. Security Considerations
 
-- **No passwords stored on disk.** Only iCloud session cookies are cached (auto-expire).
-- **Apple ID stored in plaintext** in local config file — protected by Windows user permissions.
+- **No credentials.** No Apple ID, password or session token is used or stored.
+- **USB trust.** Access requires the iPhone to be unlocked and to have trusted this PC; pairing records are managed by Apple Mobile Device Service.
+- **Read-only on the iPhone.** The sync engine only lists, stats and reads files; it never writes to or deletes from the device.
 - **All private data excluded from git** via `.gitignore`.
-- **2FA required** — no bypass for authentication.
-- **Session trust** — after 2FA, session is trusted to reduce re-authentication frequency.

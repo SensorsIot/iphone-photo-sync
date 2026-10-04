@@ -40,7 +40,7 @@ Or download the ZIP from GitHub and extract it to a folder of your choice.
 Open a terminal (Command Prompt or PowerShell) and run:
 
 ```bash
-pip install icloudpy wmi pywin32
+pip install pymobiledevice3 pillow wmi pywin32
 ```
 
 ### Step 3: Configure the target folder
@@ -117,6 +117,7 @@ Press `Ctrl+C` to stop.
 | :bust_in_silhouette: Apple ID (email only) | `%USERPROFILE%\.icloud_sync\config.json` |
 | :page_facing_up: Sync state (filenames) | `TARGET_DIR\.iphone_sync_state.json` |
 | :scroll: Watcher log | `%USERPROFILE%\.icloud_sync\watcher.log` |
+| :scroll: Sync log | `%USERPROFILE%\.icloud_sync\sync.log` (rotates at 1 MB, 3 backups) |
 
 :lock: **Nothing private is uploaded to GitHub.** The `.gitignore` excludes all credential and state files.
 
@@ -132,11 +133,14 @@ Press `Ctrl+C` to stop.
 | Terminal window flashing | Make sure the scheduled task uses `pythonw.exe`, not `python.exe` |
 | Duplicate files | Delete `TARGET_DIR\.iphone_sync_state.json` and re-run to rebuild the state |
 
-### Check the watcher log
+### Check the logs
 
 ```bash
 type %USERPROFILE%\.icloud_sync\watcher.log
+type %USERPROFILE%\.icloud_sync\sync.log
 ```
+
+`watcher.log` records iPhone connect/disconnect events; `sync.log` records every sync pass, each downloaded file, and full error tracebacks.
 
 ---
 

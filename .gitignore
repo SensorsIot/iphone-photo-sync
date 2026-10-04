@@ -2,6 +2,7 @@
 config.json
 *.session
 watcher.log
+sync.log*
 .icloud_sync/
 .iphone_sync_state.json
 

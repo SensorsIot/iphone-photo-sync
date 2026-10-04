@@ -9,8 +9,10 @@ import asyncio
 import os
 import sys
 import json
+import logging
 import struct
 import time
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
@@ -36,6 +38,24 @@ MEDIA_EXTENSIONS = {
     ".dng", ".raw", ".cr2", ".nef", ".arw",
     ".mov", ".mp4", ".m4v",
 }
+# Log file (next to the watcher log)
+LOG_FILE = os.path.join(str(Path.home()), ".icloud_sync", "sync.log")
+
+log = logging.getLogger("iphone_sync")
+
+
+def setup_logging():
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    log.addHandler(file_handler)
+    # Also echo to the console when run interactively (pythonw has no stdout)
+    if sys.stdout is not None:
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(console)
+    log.setLevel(logging.INFO)
 
 
 def load_state():
@@ -174,7 +194,8 @@ async def sync_once(afc, state):
         folder_path = f"/DCIM/{folder}"
         try:
             files = await afc.listdir(folder_path)
-        except Exception:
+        except Exception as e:
+            log.error(f"Cannot list {folder_path}: {e}")
             total_errors += 1
             continue
 
@@ -197,8 +218,10 @@ async def sync_once(afc, state):
                 if isinstance(mtime, datetime):
                     file_date = mtime
                 else:
+                    log.warning(f"No usable date for {remote_path}, skipping")
                     continue
-            except Exception:
+            except Exception as e:
+                log.warning(f"Cannot stat {remote_path}: {e}")
                 continue
 
             # Only sync today's files
@@ -249,13 +272,13 @@ async def sync_once(afc, state):
                     "synced_at": datetime.now().isoformat(),
                 }
                 size_mb = file_size / (1024 * 1024)
-                print(f"  [{total_new}] {filename} ({size_mb:.1f} MB)")
+                log.info(f"  [{total_new}] {filename} -> {local_path} ({size_mb:.1f} MB)")
 
                 if total_new % 10 == 0:
                     save_state(state)
 
             except Exception as e:
-                print(f"  ERROR {filename}: {e}")
+                log.exception(f"Download failed for {remote_path}: {e}")
                 total_errors += 1
 
     save_state(state)
@@ -263,44 +286,50 @@ async def sync_once(afc, state):
 
 
 async def main():
-    print("iPhone Photo & Video Sync (USB)")
-    print("=" * 50)
-    print(f"Target:   {TARGET_DIR}")
-    print(f"Interval: every {POLL_INTERVAL}s\n")
+    setup_logging()
+    log.info(f"iPhone Photo & Video Sync (USB) started (PID {os.getpid()})")
+    log.info(f"Target: {TARGET_DIR}, interval: {POLL_INTERVAL}s, log: {LOG_FILE}")
 
-    state = load_state()
+    try:
+        state = load_state()
+    except Exception:
+        log.exception(f"Cannot read state file {STATE_FILE}")
+        raise
+    log.info(f"State: {len(state['synced_files'])} file(s) already synced")
     run = 1
 
     while True:
-        now = datetime.now().strftime("%H:%M:%S")
         today = date.today()
-        print(f"[{now}] Sync #{run} - checking for new photos from {today}...")
+        log.info(f"Sync #{run} - checking for new photos from {today}...")
 
         try:
             lockdown, afc = await connect_iphone()
             if afc is None:
-                print(f"[{now}] iPhone not connected")
+                log.info("iPhone not connected")
             else:
-                print(f"[{now}] Connected to {lockdown.display_name}")
+                log.info(f"Connected to {lockdown.display_name}")
                 new_files, errors, new_bytes = await sync_once(afc, state)
                 if new_files > 0:
                     mb = new_bytes / (1024 * 1024)
-                    print(f"[{now}] Synced {new_files} new file(s) ({mb:.1f} MB)")
+                    log.info(f"Synced {new_files} new file(s) ({mb:.1f} MB)")
                 else:
-                    print(f"[{now}] No new files")
+                    log.info("No new files")
                 if errors > 0:
-                    print(f"[{now}] {errors} error(s)")
+                    log.warning(f"{errors} error(s)")
         except Exception as e:
-            print(f"[{now}] Error: {e}")
+            log.exception(f"Sync #{run} failed: {e}")
 
         run += 1
-        print(f"  Next check in {POLL_INTERVAL}s (Ctrl+C to stop)\n")
         try:
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
-            print("\nStopped by user.")
+            log.info("Stopped by user.")
             break
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        log.exception("Sync crashed")
+        raise
